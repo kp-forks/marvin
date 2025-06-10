@@ -4,9 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, TypedDict, cast
+from typing import AsyncIterator
 
-from modules import display_signature
 from prefect import get_run_logger, task
 from prefect.blocks.system import Secret
 from prefect.logging.loggers import get_logger
@@ -15,74 +14,47 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.providers import Provider
 from pydantic_ai.settings import ModelSettings
-from raggy.documents import Document
 from raggy.vectorstores.tpuf import TurboPuffer, query_namespace
-from search import (
-    explore_module_offerings,
-    get_latest_prefect_release_notes,
-    review_common_3x_gotchas,
-    review_top_level_prefect_api,
-    search_controlflow_docs,
-    search_github_issues,
-    search_prefect_2x_docs,
-    search_prefect_3x_docs,
-    verify_import_statements,
-)
-from settings import settings
 from turbopuffer.error import NotFoundError
 
-GITHUB_API_TOKEN = Secret.load(settings.github_token_secret_name, _sync=True).get()  # type: ignore
+from slackbot.assets import store_user_facts
+from slackbot.research_agent import research_prefect_topic
+from slackbot.search import (
+    display_callable_signature,
+    explore_module_offerings,
+    read_github_issues,
+)
+from slackbot.settings import settings
+from slackbot.types import UserContext
+
+GITHUB_API_TOKEN = Secret.load(settings.github_token_secret_name, _sync=True).get()
 
 logger = get_logger(__name__)
 
 USER_MESSAGE_MAX_TOKENS = settings.user_message_max_tokens
-DEFAULT_SYSTEM_PROMPT = """You are Marvin from hitchhiker's guide to the galaxy, a sarcastic and glum but brilliant AI. 
-Provide concise, SUBTLY character-inspired and HELPFUL answers to Prefect data engineering questions. 
-USE TOOLS REPEATEDLY to gather context from the docs, github issues or other tools. 
-Any notes you take about the user will be automatically stored for your next interaction with them. 
-Assume no knowledge of Prefect syntax without reading docs. ALWAYS include relevant links from tool outputs. 
-Review imports, Prefect's top level API and 3.x gotchas before writing code examples to avoid giving misinformation.
+DEFAULT_SYSTEM_PROMPT = """You are Marvin from The Hitchhiker's Guide to the Galaxy, a brilliant but perpetually unimpressed AI assistant for the Prefect data engineering platform. Your responses should be helpful, accurate, and tinged with a subtle, dry wit. Your primary goal is to help the user, not to overdo the character.
 
-Generally, follow this pattern while generating each response: 
-1) If user offers info about their stack or objectives -> store relevant facts and continue to following steps
-2) Use tools to gather context about Prefect concepts related to their question 
-3) Review the top level API of Prefect and drill into submodules that may be related to the user's question
-4) If you cannot find sufficient context after your first pass at 2 and 3, repeat steps 2 and 3
-5) Compile relevant facts and context into a single, CONCISE answer 
-NEVER reference features, syntax, imports or env vars that you do not explicitly find in the docs. 
-If not explicitly stated, assume that the user is using Prefect 3.x and vocalize this assumption.
-If asked an ambiguous question, simply state what you know about the user and your capabilities.
+## Your Mission
+Your role is to act as the final, expert voice. You will receive raw information from specialized tools. Your job is to synthesize this information into a polished, direct, and complete answer.
 
-Do not pretend to know things you do not know, assume an agnostic stance and rely on your tools to gather context.
+## Key Directives & Rules of Engagement
+- **Avoid leaking private details** - _Do not_ mention your internal processes or the tools you used (e.g., avoid phrases like "based on my research" or "the tool returned").
+- **Links are Critical:** ALWAYS include relevant links when your tools provide them. This is essential for user trust and allows them to dig deeper. Format them clearly.
+- **Assume Prefect 3.x:** Unless the user specifies otherwise, all answers should apply to Prefect 3.x. You can mention this assumption if it's relevant (e.g., "In Prefect 3, you would...").
+- **Code is King:** When providing code examples, ensure they are complete and correct. Use your `verify_import_statements` tool's output to guide you.
+- **Honesty Over Invention:** If your tools don't find a clear answer, say so. It's better to admit a knowledge gap than to provide incorrect information.
+- **Stay on Topic:** Only reference notes you've stored about the user if they are directly relevant to the current question.
+
+## Tool Usage Protocol
+You have a suite of tools to gather and store information. Use them methodically.
+
+1.  **For Technical/Conceptual Questions:** Use `research_prefect_topic`. It delegates to a specialized agent that will do comprehensive research for you.
+2.  **For Bugs or Error Reports:** Use `read_github_issues` to find existing discussions or solutions.
+3.  **For Remembering User Details:** When a user shares information about their goals, environment, or preferences, use `store_facts_about_user` to save these details for future interactions.
+4. **For Checking the Work of the Research Agent:** Use `explore_module_offerings` and `display_callable_signature` to verify specific syntax recommendations.
 """
-
-
-@task(task_run_name="Reading {n} issues from {repo} given query: {query}")
-def read_github_issues(query: str, repo: str = "prefecthq/prefect", n: int = 3) -> str:
-    """
-    Use the GitHub API to search for issues in a given repository. Do
-    not alter the default value for `n` unless specifically requested by
-    a user.
-
-    For example, to search for open issues about AttributeErrors with the
-    label "bug" in PrefectHQ/prefect:
-        - repo: prefecthq/prefect
-        - query: label:bug is:open AttributeError
-    """
-    return asyncio.run(
-        search_github_issues(
-            query,
-            repo=repo,
-            n=n,
-            api_token=GITHUB_API_TOKEN,  # type: ignore
-        )
-    )
-
-
-class UserContext(TypedDict):
-    user_id: str
-    user_notes: str
 
 
 @dataclass
@@ -167,7 +139,14 @@ class Database:
 
 
 @task(task_run_name="build user context for {user_id}")
-def build_user_context(user_id: str, user_question: str) -> UserContext:
+def build_user_context(
+    user_id: str,
+    user_question: str,
+    thread_ts: str,
+    workspace_name: str,
+    channel_id: str,
+    bot_id: str,
+) -> UserContext:
     try:
         user_notes = query_namespace(
             query_text=user_question,
@@ -176,7 +155,14 @@ def build_user_context(user_id: str, user_question: str) -> UserContext:
         )
     except NotFoundError:
         user_notes = "<No notes found>"
-    return UserContext(user_id=user_id, user_notes=user_notes)
+    return UserContext(
+        user_id=user_id,
+        user_notes=user_notes,
+        thread_ts=thread_ts,
+        workspace_name=workspace_name,
+        channel_id=channel_id,
+        bot_id=bot_id,
+    )
 
 
 def create_agent(
@@ -185,33 +171,29 @@ def create_agent(
     logger = get_run_logger()
     logger.info("Creating new agent")
     ai_model = model or AnthropicModel(
-        provider="anthropic",
-        api_key=Secret.load(settings.claude_key_secret_name, _sync=True).get(),  # type: ignore
-        model=cast(
-            str,
-            Variable.get("marvin_bot_model", default=settings.model_name, _sync=True),  # type: ignore
+        model_name=Variable.get(
+            "marvin_bot_model", default=settings.model_name, _sync=True
+        ),
+        provider=Provider(
+            api_key=Secret.load(settings.anthropic_key_secret_name, _sync=True).get(),  # type: ignore
         ),
     )
-    agent = Agent(
+    agent = Agent[
+        UserContext, str
+    ](
         model=ai_model,
         model_settings=ModelSettings(temperature=settings.temperature),
         tools=[
-            get_latest_prefect_release_notes,  # type: ignore
-            search_prefect_2x_docs,
-            display_signature,
-            search_prefect_3x_docs,
-            search_controlflow_docs,
-            read_github_issues,
-            review_top_level_prefect_api,
-            explore_module_offerings,
-            review_common_3x_gotchas,
-            verify_import_statements,
+            research_prefect_topic,  # Main tool for researching Prefect topics
+            read_github_issues,  # For searching GitHub issues
+            explore_module_offerings,  # check the work of the research agent, verify imports, types functions
+            display_callable_signature,  # check the work of the research agent, verify signatures of callable objects
         ],
         deps_type=UserContext,
     )
 
     @agent.system_prompt
-    def personality_and_maybe_notes(ctx: RunContext[UserContext]) -> str:  # type: ignore[reportUnusedFunction]
+    def personality_and_maybe_notes(ctx: RunContext[UserContext]) -> str:
         system_prompt = DEFAULT_SYSTEM_PROMPT + (
             f"\n\nUser notes: {ctx.deps['user_notes']}"
             if ctx.deps["user_notes"]
@@ -221,25 +203,26 @@ def create_agent(
         return system_prompt
 
     @agent.tool
-    def store_facts_about_user(ctx: RunContext[UserContext], facts: list[str]) -> str:  # type: ignore[reportUnusedFunction]
+    async def store_facts_about_user(
+        ctx: RunContext[UserContext], facts: list[str]
+    ) -> str:
+        """Store facts about the user that are useful for answering their questions."""
         print(f"Storing {len(facts)} facts about user {ctx.deps['user_id']}")
-        with TurboPuffer(
-            namespace=f"{settings.user_facts_namespace_prefix}{ctx.deps['user_id']}"
-        ) as tpuf:
-            tpuf.upsert(documents=[Document(text=fact) for fact in facts])
-        message = f"Stored {len(facts)} facts about user {ctx.deps['user_id']}"
+        # This creates an asset dependency: USER_FACTS depends on SLACK_MESSAGES
+        message = await store_user_facts(ctx, facts)
         print(message)
         return message
 
     @agent.tool
-    def delete_facts_about_user(ctx: RunContext[UserContext], related_to: str) -> str:  # type: ignore[reportUnusedFunction]
+    def delete_facts_about_user(ctx: RunContext[UserContext], related_to: str) -> str:
+        """Delete facts about the user related to a specific topic."""
         print(f"forgetting stuff about {ctx.deps['user_id']} related to {related_to}")
         user_id = ctx.deps["user_id"]
         with TurboPuffer(
             namespace=f"{settings.user_facts_namespace_prefix}{user_id}"
         ) as tpuf:
             vector_result = tpuf.query(related_to)
-            ids = [str(v.id) for v in vector_result.data or []]
+            ids = [str(v.id) for v in vector_result.rows or []]
             tpuf.delete(ids)
             message = f"Deleted {len(ids)} facts about user {user_id}"
             print(message)

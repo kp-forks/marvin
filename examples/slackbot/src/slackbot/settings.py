@@ -32,7 +32,7 @@ class SlackbotSettings(BaseSettings):
     )
 
     temperature: float = Field(
-        default=0.5, description="Temperature for model inference"
+        default=0.2, description="Temperature for model inference"
     )
     user_message_max_tokens: int = Field(
         default=500, description="Maximum tokens allowed in user messages"
@@ -49,6 +49,10 @@ class SlackbotSettings(BaseSettings):
     openai_api_key_secret_name: str = Field(
         default="openai-api-key",
         description="Name of the Prefect secret block containing OpenAI API key",
+    )
+    anthropic_key_secret_name: str = Field(
+        default="anthropic-api-key",
+        description="Name of the Prefect secret block containing Anthropic API key",
     )
 
     vector_store_type: Literal["turbopuffer"] = Field(
