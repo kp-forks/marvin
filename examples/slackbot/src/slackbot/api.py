@@ -1,27 +1,37 @@
 import asyncio
 import re
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from core import (
-    Database,
-    UserContext,
-    build_user_context,
-    create_agent,
-)
 from fastapi import FastAPI, HTTPException, Request
-from prefect import flow, get_run_logger, task
+from prefect import Flow, State, flow, get_run_logger, task
 from prefect.blocks.notifications import SlackWebhook
 from prefect.cache_policies import NONE
+from prefect.client.schemas.objects import FlowRun
 from prefect.logging.loggers import get_logger
 from prefect.states import Completed
 from prefect.variables import Variable
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import ModelMessage
-from settings import settings
-from slack import SlackPayload, get_channel_name, post_slack_message
-from strings import count_tokens, slice_tokens
-from wrap import WatchToolCalls
+
+from slackbot.assets import summarize_thread
+from slackbot.core import (
+    Database,
+    UserContext,
+    build_user_context,
+    create_agent,
+)
+from slackbot.settings import settings
+from slackbot.slack import (
+    SlackPayload,
+    create_progress_message,
+    get_channel_name,
+    get_workspace_domain,
+    post_slack_message,
+)
+from slackbot.strings import count_tokens, slice_tokens
+from slackbot.wrap import WatchToolCalls, _progress_message
 
 BOT_MENTION = r"<@(\w+)>"
 
@@ -34,6 +44,8 @@ async def run_agent(
     cleaned_message: str,
     conversation: list[ModelMessage],
     user_context: UserContext,
+    channel_id: str,
+    thread_ts: str,
     decorator_settings: dict[str, Any] | None = None,
 ) -> AgentRunResult[str]:
     if decorator_settings is None:
@@ -43,13 +55,31 @@ async def run_agent(
             "log_prints": True,
         }
 
-    with WatchToolCalls(settings=decorator_settings):
-        result = await create_agent(model="openai:gpt-4o").run(
-            user_prompt=cleaned_message,
-            message_history=conversation,
-            deps=user_context,
+    start_time = time.monotonic()
+    progress = await create_progress_message(
+        channel_id=channel_id, thread_ts=thread_ts, initial_text="🔄 Thinking..."
+    )
+
+    try:
+        token = _progress_message.set(progress)
+
+        try:
+            with WatchToolCalls(settings=decorator_settings):
+                result = await create_agent(model=settings.model_name).run(
+                    user_prompt=cleaned_message,
+                    message_history=conversation,
+                    deps=user_context,
+                )
+        finally:
+            _progress_message.reset(token)
+
+        await progress.update(
+            f"✅ thought for {time.monotonic() - start_time:.1f} seconds"
         )
         return result
+    except Exception as e:
+        await progress.update(f"❌ Error: {str(e)}")
+        raise
 
 
 @flow(name="Handle Slack Message", retries=1)
@@ -88,23 +118,52 @@ async def handle_message(payload: SlackPayload, db: Database):
         )
         conversation = await db.get_thread_messages(thread_ts)
 
+        bot_user_id = None
+        if payload.authorizations:
+            bot_auth = next(
+                (auth for auth in payload.authorizations or [] if auth.is_bot), None
+            )
+            if bot_auth:
+                bot_user_id = bot_auth.user_id
+
         user_context = build_user_context(
-            user_id=event.user,  # Use the actual user who sent the message, not the bot
+            user_id=event.user,
             user_question=cleaned_message,
+            thread_ts=thread_ts,
+            workspace_name=await get_workspace_domain(),
+            channel_id=event.channel or "unknown",
+            bot_id=bot_user_id or "unknown",
         )
 
-        result = await run_agent(cleaned_message, conversation, user_context)  # type: ignore
+        result = await run_agent(
+            cleaned_message, conversation, user_context, event.channel, thread_ts
+        )  # type: ignore
 
         await db.add_thread_messages(thread_ts, result.new_messages())
+        conversation.extend(result.new_messages())
         assert event.channel is not None, "No channel found"
         await task(post_slack_message)(
             message=result.data,
             channel_id=event.channel,
             thread_ts=thread_ts,
         )
-        return Completed(message="Responded to mention")
+        return Completed(
+            message="Responded to mention",
+            data=dict(user_context=user_context, conversation=conversation),
+        )
 
     return Completed(message="Skipping non-mention", name="SKIPPED")
+
+
+@handle_message.on_completion
+async def summarize_thread_so_far(flow: Flow, flow_run: FlowRun, state: State[Any]):
+    result = await state.result()
+    conversation = result["conversation"]
+
+    if len(conversation) % 4 != 0:  # only summarize thread every 4 messages
+        return
+
+    await summarize_thread(result["user_context"], conversation)
 
 
 @asynccontextmanager
@@ -120,11 +179,11 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/chat")
 async def chat_endpoint(request: Request) -> dict[str, Any]:
     try:
-        payload = SlackPayload(**await request.json())
+        payload = SlackPayload.model_validate(await request.json())
     except Exception as e:
         logger.error(f"Error parsing Slack payload: {e}")
-        slack_webhook = await SlackWebhook.load("marvin-bot-pager")  # type: ignore
-        await slack_webhook.notify(  # type: ignore
+        slack_webhook = await SlackWebhook.load("marvin-bot-pager")
+        await slack_webhook.notify(
             body=f"Error parsing Slack payload: {e}",
             subject="Slackbot Error",
         )
@@ -155,8 +214,8 @@ async def chat_endpoint(request: Request) -> dict[str, Any]:
             channel_name = await get_channel_name(payload.event.channel)
             if channel_name.startswith("D"):
                 logger.warning(f"Attempted DM in channel: {channel_name}")
-                slack_webhook = await SlackWebhook.load("marvin-bot-pager")  # type: ignore
-                await slack_webhook.notify(  # type: ignore
+                slack_webhook = await SlackWebhook.load("marvin-bot-pager")
+                await slack_webhook.notify(
                     body=f"Attempted DM: {channel_name}",
                     subject="Slackbot DM Warning",
                 )

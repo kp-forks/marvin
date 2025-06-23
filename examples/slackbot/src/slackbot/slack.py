@@ -5,7 +5,8 @@ from typing import Any, List, Union
 
 import httpx
 from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
-from settings import settings
+
+from slackbot.settings import settings
 
 
 class EventBlockElement(BaseModel):
@@ -279,3 +280,76 @@ async def get_workspace_info() -> dict[str, Any]:
         )
         response.raise_for_status()
         return response.json().get("team", {})
+
+
+async def get_workspace_domain() -> str:
+    """Get the workspace domain name (e.g., 'stoatllc')."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://slack.com/api/team.info",
+            headers={"Authorization": f"Bearer {settings.slack_api_token}"},
+        )
+        response.raise_for_status()
+        team_info = response.json().get("team", {})
+        return team_info.get("domain", "unknown")
+
+
+class ProgressMessage:
+    """Utility for creating and updating a progress message in Slack."""
+
+    def __init__(self, channel_id: str, thread_ts: str | None = None):
+        self.channel_id = channel_id
+        self.thread_ts = thread_ts
+        self.message_ts: str | None = None
+
+    async def start(self, initial_text: str = "🔄 Working...") -> "ProgressMessage":
+        """Create the initial progress message and return its timestamp."""
+        response = await post_slack_message(
+            message=initial_text,
+            channel_id=self.channel_id,
+            thread_ts=self.thread_ts,
+        )
+
+        response_data = response.json()
+        if response_data.get("ok"):
+            self.message_ts = response_data.get("ts")
+        else:
+            raise ValueError(
+                f"Failed to create progress message: {response_data.get('error')}"
+            )
+
+        return self
+
+    async def update(self, new_text: str, mode: str = "replace") -> None:
+        """Update the progress message."""
+        if not self.message_ts:
+            raise ValueError("Progress message not started. Call start() first.")
+
+        await edit_slack_message(
+            new_text=new_text,
+            channel_id=self.channel_id,
+            thread_ts=self.message_ts,
+            mode=mode,
+        )
+
+    async def append(self, text: str, delimiter: str = "\n") -> None:
+        """Append text to the progress message."""
+        if not self.message_ts:
+            raise ValueError("Progress message not started. Call start() first.")
+
+        await edit_slack_message(
+            new_text=text,
+            channel_id=self.channel_id,
+            thread_ts=self.message_ts,
+            mode="append",
+            delimiter=delimiter,
+        )
+
+
+async def create_progress_message(
+    channel_id: str, thread_ts: str | None = None, initial_text: str = "🔄 Working..."
+) -> ProgressMessage:
+    """Helper function to create and start a progress message."""
+    progress = ProgressMessage(channel_id, thread_ts)
+    await progress.start(initial_text)
+    return progress
