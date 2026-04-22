@@ -3,10 +3,20 @@ import subprocess
 
 import httpx
 from prefect import task
+from prefect.logging.loggers import get_logger
 from pretty_mod import display_signature
 from raggy.vectorstores.tpuf import multi_query_tpuf
 
-from slackbot.github import format_issues_summary, search_issues
+from slackbot.github import (
+    GitHubAuthError,
+    GitHubError,
+    GitHubNotFoundError,
+    GitHubRateLimitError,
+    format_issues_summary,
+    search_issues,
+)
+
+logger = get_logger(__name__)
 
 
 def explore_module_offerings(
@@ -171,8 +181,26 @@ def read_github_issues(query: str, repo: str = "prefecthq/prefect", n: int = 3) 
 
 async def _read_github_issues_async(query: str, repo: str, n: int) -> str:
     """Async helper for reading GitHub issues."""
-    issues = await search_issues(query, repo=repo, n=n)
-    return await format_issues_summary(issues)
+    try:
+        issues = await search_issues(query, repo=repo, n=n)
+        return await format_issues_summary(issues)
+    except GitHubNotFoundError:
+        return (
+            "GitHub issue search could not find that repository. "
+            "Check the repo name and try again."
+        )
+    except GitHubAuthError:
+        return (
+            "GitHub issue search is temporarily unavailable because authentication "
+            "failed."
+        )
+    except GitHubRateLimitError:
+        return "GitHub issue search is temporarily unavailable because the rate limit was exceeded."
+    except GitHubError as exc:
+        logger.warning("GitHub issue search failed: %s", exc)
+        return (
+            "GitHub issue search is temporarily unavailable due to a GitHub API error."
+        )
 
 
 def display_callable_signature(import_path: str) -> str:
